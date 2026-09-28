@@ -1,191 +1,207 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Hortalytic API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Backend for **Hortalytic**, a system for monitoring and, later, automating greenhouses.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+ESP32 devices with sensors placed in a greenhouse send measurements over MQTT. This repository holds the NestJS backend and the infrastructure around it: the MQTT broker, the time series database and the deployment setup. The long term goal is to supply devices to other greenhouse owners, collect their data and present it in an app or website.
 
-## Description
+The project is currently a proof of concept running with a single device in my own greenhouse.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+Firmware for the devices lives in [hortalytic-node](https://github.com/Guruen/hortalytic-node).
 
-## Project setup
+## Architecture
 
-```bash
-$ npm install
+```mermaid
+flowchart LR
+    subgraph Greenhouse
+        N[ESP32 node<br/>SHT41 sensor]
+    end
+    subgraph Server["Server (Docker on NAS)"]
+        B[Mosquitto<br/>MQTT broker]
+        A[NestJS API]
+        D[(PostgreSQL<br/>+ TimescaleDB)]
+        M[migrate<br/>one-shot]
+    end
+    C[App / website]
+
+    N -- "publish hortalytic/{deviceId}/telemetry, status" --> B
+    B -- "subscribe hortalytic/#" --> A
+    A -. "hortalytic/{deviceId}/cmd" .-> B
+    A --> D
+    M -- "runs before api starts" --> D
+    C -.-> A
 ```
 
-## Lokal infrastruktur (Docker)
+Dashed lines are planned and not yet built.
 
-`compose.yaml` starter TimescaleDB og Mosquitto. API'en køres på værten med `npm run start:dev`.
+### Contracts
 
-> **Vigtigt:** `docker/mosquitto/passwd` skal oprettes **FØR** første `docker compose up`.
-> Mosquitto starter ikke uden filen. Den er i `.gitignore` og skal oprettes på hver maskine (også på NAS'en).
+| | |
+|---|---|
+| Topics | `hortalytic/{deviceId}/telemetry`, `hortalytic/{deviceId}/status`, `hortalytic/{deviceId}/cmd` |
+| Payload | Versioned JSON (field `v`) that carries the device's own timestamp |
+| Data model | User → Greenhouse → Device → Reading |
+| Device identity | `deviceId` is the device's MQTT username. `hortalytic-api` is reserved for the backend |
+
+## Tech stack
+
+- **NestJS** on Node 24, TypeScript, native ESM
+- **MQTT** with Eclipse Mosquitto 2
+- **PostgreSQL 17 + TimescaleDB** for measurements
+- **Drizzle ORM** with the postgres.js driver, migrations with drizzle-kit
+- **Zod** for configuration validation
+- **Vitest** (via unplugin-swc so decorator metadata works) and **Testcontainers** for integration tests
+- **oxlint** and Prettier
+- **Docker Compose** for local development and for production on a NAS
+
+## Design decisions
+
+**MQTT instead of HTTP for devices.** The devices are small microcontrollers on greenhouse Wi-Fi that can be unreliable. MQTT keeps one lightweight connection open, has QoS and retained messages built in, and gives a natural channel back to the device (`cmd`) without the device having to poll or run an HTTP server that is reachable from outside. It also decouples the devices from the API: the broker keeps accepting messages while the API restarts.
+
+**Credentials and ACL per device.** Every device has its own MQTT username and password, never a shared key. The ACL uses Mosquitto's `%u` pattern so a device can only write to its own `telemetry` and `status` topics and only read its own `cmd` topic. A compromised or misbehaving device cannot publish on behalf of another one. The backend user has access to `hortalytic/#`. The username `hortalytic-api` is also blocked as a device id by a check constraint in the database.
+
+```
+user hortalytic-api
+topic readwrite hortalytic/#
+
+pattern write hortalytic/%u/telemetry
+pattern write hortalytic/%u/status
+pattern read  hortalytic/%u/cmd
+```
+
+**Readings in long format.** Measurements are stored as one row per value: `(time, device_id, sensor, metric, value)`. Adding a new sensor type, such as light or soil moisture, requires no schema change or migration. It also makes queries across devices and metrics uniform. The trade off is more rows, which is what TimescaleDB is built to handle.
+
+**TimescaleDB hypertable.** `readings` is a hypertable partitioned on `time`. Because TimescaleDB requires unique constraints to include the partitioning column, the primary key is `(device_id, sensor, metric, time)`. That key doubles as idempotency: MQTT can redeliver a message, and inserts use `ON CONFLICT DO NOTHING`, so a duplicate is silently ignored. An index on `(device_id, time DESC)` serves the typical "latest readings for this device" query.
+
+**Device timestamp, not server timestamp.** The payload carries the time the device took the measurement. This keeps data correct when messages are delayed or buffered.
+
+**Drizzle, because of TimescaleDB migrations.** Drizzle keeps the schema in plain TypeScript next to the module that owns it and generates readable SQL migrations that are committed to `drizzle/`. Crucially, it allows custom SQL migrations in the same migration history, which is where TimescaleDB specific statements like `create_hypertable` live. `drizzle-kit push` is never used, since it knows nothing about hypertables and would drift from the migration history.
+
+**Migrations as a one-shot service.** In production, migrations do not run on application startup. A separate `migrate` service in `compose.prod.yaml` runs them once, and the API only starts if it completed successfully. drizzle-kit stays out of the production image because the migration runner uses `drizzle-orm`'s migrator directly.
+
+**Modular monolith.** Code is organised in feature modules under `src/modules/` (ingestion, devices, telemetry, greenhouses, users, auth). Each module owns its tables. The ingestion module may only depend on devices and telemetry and contains no business logic, so it can later be lifted out as a separate app in a Nest monorepo if ingestion needs to scale independently. One deployable keeps operations simple while the boundaries are still being discovered.
+
+**Devices can exist without an owner.** `greenhouse_id` on a device is nullable, so a device can be registered first and claimed by a user later.
+
+**Validated configuration.** All environment variables are validated with Zod at startup, and the app refuses to start on invalid config. The migration script and `drizzle.config.ts` reuse a subset of the same schema.
+
+**Mosquitto file permissions handled in the container.** Mosquitto 2 requires `passwd` and `acl` to be owned by uid 1883 with mode `0700`, which cannot be relied on for bind mounts from Windows or a NAS. A small entrypoint copies the files into the container's own filesystem with the right owner and mode on every start, so the setup behaves the same on every host.
+
+**Integration tests against the real database.** Schema behaviour that matters (hypertable, index, duplicate handling, foreign keys, the reserved id) is tested against a real TimescaleDB started with Testcontainers, using the same pinned image as the compose files.
+
+## Getting started
+
+Requirements: Node 24, Docker.
+
+`compose.yaml` starts TimescaleDB and Mosquitto. The API runs on the host.
+
+> `docker/mosquitto/passwd` must exist **before** the first `docker compose up`. Mosquitto will not start without it. The file is git ignored and has to be created on every machine.
 
 ```bash
-# 1. Env – udfyld passwords
+npm install
+
+# 1. Environment: fill in the passwords
 cp .env.example .env
 
-# 2. Opret passwd med backend-brugeren (brug samme password som MQTT_PASSWORD i .env)
+# 2. Create the passwd file with the backend user.
+#    Use the same password as MQTT_PASSWORD in .env
 docker compose run --rm --entrypoint mosquitto_passwd mosquitto -b -c /mosquitto/config-src/passwd hortalytic-api <MQTT_PASSWORD>
 
-# 3. Start
+# 3. Start the infrastructure and run migrations
 docker compose up -d
+npm run db:migrate
+
+# 4. Start the API in watch mode
+npm run start:dev
 ```
 
-`-b` (batch) tager passwordet som argument, fordi den interaktive password-prompt ikke virker gennem `docker compose run` på Windows ("Error: Empty password"). Bagsiden er, at passwordet havner i shell-historikken.
+`-b` (batch mode) takes the password as an argument. It is used because the interactive password prompt does not work through `docker compose run` on Windows ("Error: Empty password"). The downside is that the password ends up in shell history. On Linux or macOS you can drop `-b` and the password argument to get the interactive prompt instead.
 
-### Tilføj en enhed
+### Add a device
 
-Brugernavn = deviceId (`hortalytic-api` er reserveret). Udelad `-c`, da den overskriver filen:
+The username is the device id (`hortalytic-api` is reserved). Leave out `-c`, since it overwrites the file:
 
 ```bash
 docker compose run --rm --entrypoint mosquitto_passwd mosquitto -b /mosquitto/config-src/passwd <deviceId> <password>
 docker compose restart mosquitto
 ```
 
-ACL'en (`docker/mosquitto/acl`) giver hver enhed skriveadgang til `hortalytic/<deviceId>/telemetry|status` og læseadgang til `hortalytic/<deviceId>/cmd`.
+Mosquitto has to be restarted after changes to `passwd` or `acl`, because the entrypoint copies them in at startup.
 
-### Rettigheder
+### Database
 
-Mosquitto 2 kræver, at `passwd` og `acl` ejes af uid 1883 med `0700`. Det klarer `docker/mosquitto/entrypoint.sh`: ved hver start kopieres filerne ind i containeren med de rigtige rettigheder, så du ikke skal køre `chown`/`chmod` på værten. Det virker ens på Windows og på NAS'en. Derfor skal Mosquitto genstartes efter ændringer i `passwd` eller `acl`.
+```bash
+# After changing a *.schema.ts: generate a migration in drizzle/ and commit it
+npm run db:generate
 
-### Deploy på NAS
+# TimescaleDB specific SQL (hypertables, policies) as a custom migration
+npx drizzle-kit generate --custom --name=<name>
 
-Kræver repoet (api'en bygges på NAS'en), `.env` og `docker/mosquitto/passwd`, som oprettes som ovenfor, men med `-f compose.prod.yaml`:
+# Run migrations against the local database
+npm run db:migrate
+```
+
+### Tests
+
+```bash
+npm run test       # unit tests
+npm run test:int   # integration tests against TimescaleDB in Testcontainers (Docker must be running)
+npm run test:cov   # coverage
+npm run lint
+```
+
+### Production (NAS)
+
+Production runs the API, TimescaleDB and Mosquitto with `compose.prod.yaml`. The API image is built on the NAS. It needs the repository, `.env` and `docker/mosquitto/passwd`, created as above but with `-f compose.prod.yaml`:
 
 ```bash
 docker compose -f compose.prod.yaml run --rm --entrypoint mosquitto_passwd mosquitto -b -c /mosquitto/config-src/passwd hortalytic-api <MQTT_PASSWORD>
 docker compose -f compose.prod.yaml up -d --build
 ```
 
-`migrate`-servicen kører databasemigrationerne én gang, før `api` starter. Fejler en migration, starter api'en ikke. Se loggen med `docker compose -f compose.prod.yaml logs migrate`.
+If a migration fails, the API does not start. Check with `docker compose -f compose.prod.yaml logs migrate`.
 
-## Database (Drizzle)
+## Status
 
-```bash
-# Efter ændringer i et *.schema.ts: generér en migration i drizzle/ og commit den
-npm run db:generate
+Built:
 
-# TimescaleDB-specifik SQL (hypertables, policies) som custom migration
-npx drizzle-kit generate --custom --name=<navn>
+- Project setup: NestJS with ESM, Vitest, oxlint, multi-stage Dockerfile
+- Config validation at startup
+- Global database module with Drizzle and graceful shutdown
+- Schema for `devices` and `readings`, with `readings` as a TimescaleDB hypertable
+- One-shot migration service for production
+- Integration tests for the schema against real TimescaleDB
+- Mosquitto with authentication and per-device ACL, local and production compose setups
 
-# Kør migrationer mod den lokale db fra compose.yaml
-npm run db:migrate
-```
+Not built yet:
 
-Brug aldrig `drizzle-kit push`, da den ikke kender til hypertables.
+- The MQTT client and ingestion module that subscribes to telemetry and writes readings
+- Greenhouses, users and auth
 
-## Compile and run the project
+## Roadmap
 
-```bash
-# development
-$ npm run start
+1. Ingestion: subscribe to `hortalytic/+/telemetry`, validate versioned payloads, write readings idempotently, update `last_seen_at`
+2. Device status handling (`status` topic) and a REST API for reading data
+3. Users, greenhouses and device claiming
+4. TLS on port 8883 so devices can connect from outside the LAN
+5. Retention and aggregation policies in TimescaleDB
+6. Commands to devices over the `cmd` topic as the basis for automation
+7. App or website for greenhouse owners
 
-# watch mode
-$ npm run start:dev
+## Related repository
 
-# production mode
-$ npm run start:prod
-```
+- [hortalytic-node](https://github.com/Guruen/hortalytic-node): ESP32 firmware for the sensor devices
 
-## Run tests
+## About the developer
 
-```bash
-# unit tests
-$ npm run test
+Brian Brandt, developer with a focus on backend. I work mainly with NestJS, TypeScript and microservices.
 
-# e2e tests
-$ npm run test:e2e
-
-# integrationstests mod rigtig TimescaleDB (Testcontainers, kræver at Docker kører)
-$ npm run test:int
-
-# test coverage
-$ npm run test:cov
-```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Observability
-
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-To add it to this project:
-
-```bash
-$ npm install @nestjs/observe
-```
-
-Then follow the [setup guide](https://docs.nestjs.com/observability/overview) - it takes a single import and an app key.
-
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+- GitHub: [Guruen](https://github.com/Guruen)
+- LinkedIn: [LINKEDIN_URL]
 
 ## License
 
 Copyright (c) 2026 Brian Brandt. All rights reserved.
 
-Koden er offentligt synlig udelukkende som reference og portfolio. Den må ikke bruges, kopieres, ændres eller distribueres uden forudgående skriftlig tilladelse. Se [LICENSE](LICENSE).
+This is proprietary software. The source code is public for viewing only, as reference and portfolio. It may not be used, copied, modified or distributed without prior written permission. See [LICENSE](LICENSE).
 
-NestJS og de øvrige dependencies er underlagt deres egne licenser.
+NestJS and the other dependencies are covered by their own licenses.
