@@ -3,25 +3,39 @@
 # Opret docker/mosquitto/passwd FØR første `docker compose up` (se README).
 #
 #   docker compose -f compose.prod.yaml up -d --build
+#
+# migrate kører DB-migrationer én gang før api starter. Manuelt:
+#   docker compose -f compose.prod.yaml run --rm migrate
+
+x-api: &api
+  build: .
+  image: hortalytic-api:latest
+  platform: linux/amd64
+  env_file: .env
+  environment:
+    NODE_ENV: production
+    PORT: 3000
+    DB_HOST: db
+    DB_PORT: 5432
+    MQTT_URL: mqtt://mosquitto:1883
 
 services:
-  api:
-    build: .
-    image: hortalytic-api:latest
-    platform: linux/amd64
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      NODE_ENV: production
-      PORT: 3000
-      DB_HOST: db
-      DB_PORT: 5432
-      MQTT_URL: mqtt://mosquitto:1883
-    ports:
-      - '${PORT:-3000}:3000'
+  migrate:
+    <<: *api
+    command: ['node', 'dist/database/migrate.js']
+    restart: 'no'
     depends_on:
       db:
         condition: service_healthy
+
+  api:
+    <<: *api
+    restart: unless-stopped
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
       mosquitto:
         condition: service_started
 
@@ -44,7 +58,7 @@ services:
     image: eclipse-mosquitto:2.1.2-alpine
     restart: unless-stopped
     entrypoint: ['/bin/sh', '/mosquitto/config-src/entrypoint.sh']
-    # Enheder på LAN skal kunne nå brokeren. Ingen TLS endnu (se claude.md).
+    # Enheder på LAN skal kunne nå brokeren. Ingen TLS endnu (se CLAUDE.md).
     ports:
       - '1883:1883'
     volumes:

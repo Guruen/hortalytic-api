@@ -1,4 +1,4 @@
-import { validateEnv } from './env.schema.js';
+import { validateDbEnv, validateEnv } from './env.schema.js';
 
 const valid = {
   POSTGRES_USER: 'hortalytic',
@@ -40,5 +40,28 @@ describe('validateEnv', () => {
     expect(() =>
       validateEnv({ ...valid, MQTT_URL: 'http://localhost:1883' }),
     ).toThrow(/MQTT_URL/);
+  });
+});
+
+describe('validateDbEnv', () => {
+  it('kræver kun DB-felterne', () => {
+    const {
+      MQTT_URL: _u,
+      MQTT_USERNAME: _n,
+      MQTT_PASSWORD: _p,
+      ...dbOnly
+    } = valid;
+    expect(validateDbEnv(dbOnly)).toEqual({
+      POSTGRES_USER: 'hortalytic',
+      POSTGRES_PASSWORD: 'secret',
+      POSTGRES_DB: 'hortalytic',
+      DB_HOST: 'localhost',
+      DB_PORT: 5432,
+    });
+  });
+
+  it('afviser manglende DB-felt', () => {
+    const { DB_HOST: _, ...missing } = valid;
+    expect(() => validateDbEnv(missing)).toThrow(/DB_HOST/);
   });
 });

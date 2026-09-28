@@ -75,6 +75,23 @@ docker compose -f compose.prod.yaml run --rm --entrypoint mosquitto_passwd mosqu
 docker compose -f compose.prod.yaml up -d --build
 ```
 
+`migrate`-servicen kører databasemigrationerne én gang, før `api` starter. Fejler en migration, starter api'en ikke. Se loggen med `docker compose -f compose.prod.yaml logs migrate`.
+
+## Database (Drizzle)
+
+```bash
+# Efter ændringer i et *.schema.ts: generér en migration i drizzle/ og commit den
+npm run db:generate
+
+# TimescaleDB-specifik SQL (hypertables, policies) som custom migration
+npx drizzle-kit generate --custom --name=<navn>
+
+# Kør migrationer mod den lokale db fra compose.yaml
+npm run db:migrate
+```
+
+Brug aldrig `drizzle-kit push`, da den ikke kender til hypertables.
+
 ## Compile and run the project
 
 ```bash
@@ -96,6 +113,9 @@ $ npm run test
 
 # e2e tests
 $ npm run test:e2e
+
+# integrationstests mod rigtig TimescaleDB (Testcontainers, kræver at Docker kører)
+$ npm run test:int
 
 # test coverage
 $ npm run test:cov
