@@ -1,14 +1,17 @@
 {
-  "name": "green-house",
+  "name": "hortalytic-api",
   "version": "0.0.1",
-  "description": "",
-  "author": "",
+  "description": "Backend for Hortalytic greenhouse monitoring: MQTT ingestion of sensor readings into TimescaleDB",
+  "author": "Brian Brandt",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Guruen/hortalytic-api.git"
+  },
   "private": true,
   "license": "UNLICENSED",
   "type": "module",
   "scripts": {
     "build": "nest build",
-    "deploy": "nest deploy",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
@@ -39,7 +42,6 @@
   },
   "devDependencies": {
     "@nestjs/cli": "^12.0.0",
-    "@nestjs/mau": "^0.2.6",
     "@nestjs/schematics": "^12.0.0",
     "@nestjs/testing": "^12.0.1",
     "@testcontainers/postgresql": "^12.1.0",
