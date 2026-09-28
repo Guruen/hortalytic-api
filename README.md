@@ -43,18 +43,20 @@ $ npm install
 cp .env.example .env
 
 # 2. Opret passwd med backend-brugeren (brug samme password som MQTT_PASSWORD i .env)
-docker compose run --rm --entrypoint mosquitto_passwd mosquitto -c /mosquitto/config-src/passwd hortalytic-api
+docker compose run --rm --entrypoint mosquitto_passwd mosquitto -b -c /mosquitto/config-src/passwd hortalytic-api <MQTT_PASSWORD>
 
 # 3. Start
 docker compose up -d
 ```
+
+`-b` (batch) tager passwordet som argument, fordi den interaktive password-prompt ikke virker gennem `docker compose run` på Windows ("Error: Empty password"). Bagsiden er, at passwordet havner i shell-historikken.
 
 ### Tilføj en enhed
 
 Brugernavn = deviceId (`hortalytic-api` er reserveret). Udelad `-c`, da den overskriver filen:
 
 ```bash
-docker compose run --rm --entrypoint mosquitto_passwd mosquitto /mosquitto/config-src/passwd <deviceId>
+docker compose run --rm --entrypoint mosquitto_passwd mosquitto -b /mosquitto/config-src/passwd <deviceId> <password>
 docker compose restart mosquitto
 ```
 
@@ -69,7 +71,7 @@ Mosquitto 2 kræver, at `passwd` og `acl` ejes af uid 1883 med `0700`. Det klare
 Kræver repoet (api'en bygges på NAS'en), `.env` og `docker/mosquitto/passwd`, som oprettes som ovenfor, men med `-f compose.prod.yaml`:
 
 ```bash
-docker compose -f compose.prod.yaml run --rm --entrypoint mosquitto_passwd mosquitto -c /mosquitto/config-src/passwd hortalytic-api
+docker compose -f compose.prod.yaml run --rm --entrypoint mosquitto_passwd mosquitto -b -c /mosquitto/config-src/passwd hortalytic-api <MQTT_PASSWORD>
 docker compose -f compose.prod.yaml up -d --build
 ```
 
