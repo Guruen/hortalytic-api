@@ -1,0 +1,58 @@
+# Prod på NAS: api + DB + Mosquitto.
+# Kræver kun denne fil, docker/ og .env (plus kildekoden, da api'en bygges lokalt).
+# Opret docker/mosquitto/passwd FØR første `docker compose up` (se README).
+#
+#   docker compose -f compose.prod.yaml up -d --build
+
+services:
+  api:
+    build: .
+    image: hortalytic-api:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST: db
+      DB_PORT: 5432
+      MQTT_URL: mqtt://mosquitto:1883
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      db:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+  db:
+    image: timescale/timescaledb:2.30.1-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mosquitto:
+    image: eclipse-mosquitto:2.1.2-alpine
+    restart: unless-stopped
+    entrypoint: ['/bin/sh', '/mosquitto/config-src/entrypoint.sh']
+    # Enheder på LAN skal kunne nå brokeren. Ingen TLS endnu (se claude.md).
+    ports:
+      - '1883:1883'
+    volumes:
+      - ./docker/mosquitto:/mosquitto/config-src
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+volumes:
+  db_data:
+  mosquitto_data:
+  mosquitto_log:

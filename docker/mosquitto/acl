@@ -1,0 +1,8 @@
+# Backend. "hortalytic-api" er reserveret og må aldrig bruges som deviceId.
+user hortalytic-api
+topic readwrite hortalytic/#
+
+# Enheder: brugernavn = deviceId, og hver enhed har kun adgang til sine egne topics.
+pattern write hortalytic/%u/telemetry
+pattern write hortalytic/%u/status
+pattern read hortalytic/%u/cmd
